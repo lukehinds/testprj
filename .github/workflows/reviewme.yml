@@ -1,29 +1,225 @@
-name: AI Code Review
+name: "Stitch Action"
+description: "Runs stitch to modify code and creates a PR with the code changes"
+inputs:
+  base_branch:
+    description: "The branch to target with the PR"
+    required: false
+    default: "main"
+  issue_number:
+    description: "The issue number that stitch should fix"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
 
-on:
-  pull_request:
-    types: [opened, synchronize]
+    - name: Download Stitch Agent from private Pypi server
+    env:
+      PYPI_USERNAME: ${{ secrets.PYPI_USERNAME }}
+      PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+      run: |
+        pip install --extra-index-url https://${PYPI_USERNAME}:${PYPI_PASSWORD}@pypi.stacklok.dev stitch
 
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install .
-      
-      - name: Run AI Code Review
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: reviewme
+    - name: Create Stitch Task ID
+      id: task-id
+      run: |
+        # Generate a random task ID
+        TASK_ID="task-$(date +%s)-$RANDOM"
+        echo "TASK_ID=$TASK_ID" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Create Stitch Agent UUID
+      id: create-agent-uuid
+      run: |
+        # Create a random UUID for the agent
+        AGENT_UUID=$(uuidgen)
+        echo "AGENT_UUID=$AGENT_UUID" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Create Stitch Agent
+      id: create-agent
+      run: |
+        AGENT_PAYLOAD=$(jq -n \
+          --arg uuid "$AGENT_UUID" \
+          --arg env_var "ANTHROPIC_API_KEY" \
+          '{
+            apiVersion: "v1",
+            kind: "SingleAgent",
+            id: $uuid,
+            metadata: {
+              name: "python-helper"
+            },
+            spec: {
+              agent: {
+                model: {
+                  provider: "anthropic",
+                  name: "claude-3-7-sonnet-latest",
+                  auth: {
+                    type: "env",
+                    env_auth: {
+                      env: $env_var
+                    }
+                  }
+                },
+                system_prompt: "You are a helpful coding assistant specializing in Python.",
+                tools: ["read_file", "write_file"],
+                mcp_servers: [
+                  {
+                    server_name: "time",
+                    description: "Fetches time from the server",
+                    type: "stdio",
+                    command: "uvx",
+                    args: ["mcp-server-time", "--local-timezone", "Europe/London"]
+                  }
+                ]
+              }
+            }
+          }')
+
+        curl -X POST http://127.0.0.1:8000/api/v1/jsonrpc \
+            -H "Content-Type: application/json" \
+            -d "$AGENT_PAYLOAD"
+      shell: bash
+
+
+    - name: Submit stitch task
+      id: run-stitch
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ISSUE_NUMBER: ${{ inputs.issue_number }}
+        AGENT_NAME: python-helper  # update this dynamically if needed
+        TASK_ID: ${{ steps.task-id.outputs.TASK_ID }}
+      run: |
+        # Fetch issue details using GitHub CLI
+        ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body -q .body)
+
+        # Create the JSON-RPC payload using jq
+        TASK_PAYLOAD=$(jq -n \
+          --arg task_id "$TASK_ID" \
+          --arg message_text "$ISSUE_BODY" \
+          '{
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tasks/send",
+            params: {
+              id: $task_id,
+              message: {
+                role: "user",
+                parts: [
+                  {
+                    type: "text",
+                    text: $message_text
+                  }
+                ]
+              }
+            }
+          }')
+
+        # Send the request to the Stitch agent endpoint
+        curl -X POST "http://127.0.0.1:8000/api/v1/agents/${AGENT_NAME}/jsonrpc" \
+            -H "Content-Type: application/json" \
+            -d "$TASK_PAYLOAD"
+      shell: bash
+
+
+    - name: Poll for task completion
+      id: poll-task
+      run: |
+        # Poll for task completion
+        echo "Polling for task status..."
+        MAX_ATTEMPTS=30
+        ATTEMPT=0
+        SLEEP_TIME=10
+
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          # Prepare the get request payload
+          GET_PAYLOAD=$(jq -n \
+            --arg task_id "$TASK_ID" \
+            '{
+              "jsonrpc": "2.0",
+              "id": "1",
+              "method": "tasks/get",
+              "params": {
+                "id": $task_id
+              }
+            }')
+
+          # Get the current task status
+          RESPONSE=$(curl https://8b20-2001-1c00-ba81-b500-ac9f-d50b-de1b-88c2.ngrok-free.app/api/v1/jsonrpc \
+          -H "Content-Type: application/json" \
+          -d "$GET_PAYLOAD")
+
+          # Extract the state
+          STATE=$(echo "$RESPONSE" | jq -r '.result.status.state')
+          echo "Current state: $STATE"
+
+          if [ "$STATE" = "completed" ]; then
+            echo "Task completed!"
+
+            # Save response for next step
+            echo "$RESPONSE" > task_response.json
+            break
+          elif [ "$STATE" != "working" ]; then
+            echo "Task failed"
+            exit 1
+          fi
+
+          ATTEMPT=$((ATTEMPT+1))
+          if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+            echo "Waiting for task completion... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+            sleep $SLEEP_TIME
+          else
+            echo "Maximum polling attempts reached. Task is still processing."
+          fi
+        done
+      shell: bash
+
+    - name: Apply code changes
+      id: apply-changes
+      env:
+        ISSUE_NUMBER: ${{ inputs.issue_number }}
+      run: |
+        # Extract git diff from the artifacts
+        GIT_DIFF=$(cat task_response.json | jq -r '.result.artifacts[] | select(.name=="git_diff") | .parts[0].text')
+
+        # Reset any changes in the working directory
+        git reset --hard HEAD
+        git clean -fd
+
+        if [ -n "$GIT_DIFF" ]; then
+          echo "Found git diff, applying changes..."
+          echo "$GIT_DIFF" > changes.diff
+          git apply changes.diff || { echo "Failed to apply diff"; exit 1; }
+          rm changes.diff
+
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          git add .
+          git checkout -b "fix-issue-$ISSUE_NUMBER"
+          git commit -m "Fix #$ISSUE_NUMBER"
+
+          echo "Changes applied successfully"
+        else
+          echo "No git diff found in response"
+          exit 1
+        fi
+      shell: bash
+
+    - name: Create Pull Request
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Get current branch name
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+        git push origin $CURRENT_BRANCH
+
+        gh pr create \
+          --base ${{ inputs.base_branch }} \
+          --head $CURRENT_BRANCH \
+          --fill
+      shell: bash
