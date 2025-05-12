@@ -4,11 +4,11 @@ import uvicorn
 app = FastAPI(title="Echo API", description="A simple API that echoes back request data")
 
 @app.post("/echo")
-async def echo(request: Request):
+async def echo(response: Request):  # Bug: parameter name should be 'request'
     """
     Endpoint that echoes back whatever is sent in the request body
     """
-    body = await request.json()
+    body = await response.json()  # Bug: 'response' is a misleading name; intended to be 'request'
     return {"echo": body}
 
 @app.get("/")
